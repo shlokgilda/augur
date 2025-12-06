@@ -103,7 +103,9 @@ class BulkGithubEventCollection(GithubEventCollection):
 
         self.task_name = f"Bulk Github Event task"
         self.repo_identifier = ""
-
+        # Pre-built mappings - initialized in collect() to avoid per-batch table scans
+        self._issue_url_to_id_map = None
+        self._pr_url_to_id_map = None
 
         super().__init__(logger)
 
@@ -115,15 +117,19 @@ class BulkGithubEventCollection(GithubEventCollection):
         owner, repo = get_owner_repo(repo_git)
         self.repo_identifier = f"{owner}/{repo}"
 
+        # Build URL-to-ID mappings ONCE before the batch loop
+        # This avoids full table scans on every 500-event batch
+        self._issue_url_to_id_map = self._build_issue_url_to_id_map(repo_id)
+        self._pr_url_to_id_map = self._build_pr_url_to_id_map(repo_id)
+
         events = []
         for event in self._collect_events(repo_git, key_auth, since):
             events.append(event)
 
-            # making this a decent size since process_events retrieves all the issues and prs each time
             if len(events) >= 500:
                 self._process_events(events, repo_id)
                 events.clear()
-    
+
         if events:
             self._process_events(events, repo_id)
         
@@ -167,12 +173,12 @@ class BulkGithubEventCollection(GithubEventCollection):
         update_issue_closed_cntrbs_by_repo_id(repo_id)
 
     def _process_issue_events(self, issue_events, repo_id):
-        
+
         issue_event_dicts = []
         contributors = []
 
-
-        issue_url_to_id_map = self._get_map_from_issue_url_to_id(repo_id)
+        # Use pre-built mapping (built once in collect(), not per batch)
+        issue_url_to_id_map = self._issue_url_to_id_map
 
         for event in issue_events:
 
@@ -201,11 +207,12 @@ class BulkGithubEventCollection(GithubEventCollection):
         self._insert_issue_events(issue_event_dicts)
 
     def _process_pr_events(self, pr_events, repo_id):
-                
+
         pr_event_dicts = []
         contributors = []
 
-        pr_url_to_id_map = self._get_map_from_pr_url_to_id(repo_id)
+        # Use pre-built mapping (built once in collect(), not per batch)
+        pr_url_to_id_map = self._pr_url_to_id_map
 
         for event in pr_events:
 
@@ -234,23 +241,25 @@ class BulkGithubEventCollection(GithubEventCollection):
 
         self._insert_pr_events(pr_event_dicts)
 
-    def _get_map_from_pr_url_to_id(self, repo_id):
+    def _build_pr_url_to_id_map(self, repo_id):
+        """
+        Build mapping from PR URLs to PR IDs.
 
-        pr_url_to_id_map = {}
+        Should be called ONCE in collect() before the batch loop,
+        not per batch. This avoids full table scans on every iteration.
+        """
         prs = get_pull_requests_by_repo_id(repo_id)
-        for pr in prs:            
-            pr_url_to_id_map[pr.pr_url] = pr.pull_request_id
+        return {pr.pr_url: pr.pull_request_id for pr in prs}
 
-        return pr_url_to_id_map
-    
-    def _get_map_from_issue_url_to_id(self, repo_id):
+    def _build_issue_url_to_id_map(self, repo_id):
+        """
+        Build mapping from issue URLs to issue IDs.
 
-        issue_url_to_id_map = {}
+        Should be called ONCE in collect() before the batch loop,
+        not per batch. This avoids full table scans on every iteration.
+        """
         issues = get_issues_by_repo_id(repo_id)
-        for issue in issues:
-            issue_url_to_id_map[issue.issue_url] = issue.issue_id
-
-        return issue_url_to_id_map
+        return {issue.issue_url: issue.issue_id for issue in issues}
 
     def _is_pr_event(self, event):
 

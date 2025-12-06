@@ -37,17 +37,21 @@ def collect_github_messages(repo_git: str, full_collection: bool) -> None:
             core_data_last_collected = (get_core_data_last_collected(repo_id) - timedelta(days=2)).replace(tzinfo=timezone.utc)
 
         
+        # Build issue/PR URL -> ID mappings ONCE before processing any messages
+        # This avoids full table scans on every batch iteration
+        issue_url_to_id_map, pr_issue_url_to_id_map = _build_message_mappings(augur_db, repo_id)
+
         if is_repo_small(repo_id):
             message_data = fast_retrieve_all_pr_and_issue_messages(repo_git, logger, manifest.key_auth, task_name, core_data_last_collected)
-            
+
             if message_data:
-                process_messages(message_data, task_name, repo_id, logger, augur_db)
+                process_messages(message_data, task_name, repo_id, logger, augur_db, issue_url_to_id_map, pr_issue_url_to_id_map)
 
             else:
                 logger.info(f"{owner}/{repo} has no messages")
 
         else:
-            process_large_issue_and_pr_message_collection(repo_id, repo_git, logger, manifest.key_auth, task_name, augur_db, core_data_last_collected)
+            process_large_issue_and_pr_message_collection(repo_id, repo_git, logger, manifest.key_auth, task_name, augur_db, core_data_last_collected, issue_url_to_id_map, pr_issue_url_to_id_map)
 
 
 def is_repo_small(repo_id):
@@ -57,6 +61,32 @@ def is_repo_small(repo_id):
         result = session.query(CollectionStatus).filter(CollectionStatus.repo_id == repo_id, CollectionStatus.issue_pr_sum <= 10).first()
 
         return result != None
+
+
+def _build_message_mappings(augur_db, repo_id):
+    """
+    Build mappings from issue/PR URLs to their IDs.
+
+    Should be called ONCE before processing messages, not per batch.
+    This avoids full table scans on every batch iteration.
+
+    Args:
+        augur_db: Database session instance.
+        repo_id: The repository ID.
+
+    Returns:
+        tuple: (issue_url_to_id_map, pr_issue_url_to_id_map)
+    """
+    # Build issue URL -> issue ID mapping
+    issues = augur_db.session.query(Issue).filter(Issue.repo_id == repo_id).all()
+    issue_url_to_id_map = {issue.issue_url: issue.issue_id for issue in issues}
+
+    # Build PR issue URL -> pull request ID mapping
+    prs = augur_db.session.query(PullRequest).filter(PullRequest.repo_id == repo_id).all()
+    pr_issue_url_to_id_map = {pr.pr_issue_url: pr.pull_request_id for pr in prs}
+
+    return issue_url_to_id_map, pr_issue_url_to_id_map
+
 
 def fast_retrieve_all_pr_and_issue_messages(repo_git: str, logger, key_auth, task_name, since) -> None:
 
@@ -80,8 +110,24 @@ def fast_retrieve_all_pr_and_issue_messages(repo_git: str, logger, key_auth, tas
     return list(github_data_access.paginate_resource(url))
 
 
-def process_large_issue_and_pr_message_collection(repo_id, repo_git: str, logger, key_auth, task_name, augur_db, since) -> None:
+def process_large_issue_and_pr_message_collection(repo_id, repo_git: str, logger, key_auth, task_name, augur_db, since, issue_url_to_id_map, pr_issue_url_to_id_map) -> None:
+    """
+    Process messages for large repositories in batches.
 
+    Collects messages from individual issue/PR comment URLs and processes them
+    in batches of 1000 to limit memory usage.
+
+    Args:
+        repo_id: The repository ID.
+        repo_git: The repository git URL.
+        logger: Logger instance.
+        key_auth: GitHub API key authentication.
+        task_name: Task name for logging.
+        augur_db: Database session instance.
+        since: Datetime to filter messages since (or None for full collection).
+        issue_url_to_id_map: Pre-built mapping of issue URLs to issue IDs.
+        pr_issue_url_to_id_map: Pre-built mapping of PR issue URLs to PR IDs.
+    """
     owner, repo = get_owner_repo(repo_git)
 
     # define logger for task
@@ -104,7 +150,7 @@ def process_large_issue_and_pr_message_collection(repo_id, repo_git: str, logger
                 UNION
                 (select comments_url as comment_url from issues WHERE repo_id={repo_id} order by created_at desc);
             """)
-        
+
 
         result = connection.execute(query).fetchall()
     comment_urls = [x[0] for x in result]
@@ -113,6 +159,8 @@ def process_large_issue_and_pr_message_collection(repo_id, repo_git: str, logger
 
     logger.info(f"{task_name}: Collecting github messages for {len(comment_urls)} prs/issues")
 
+    # Batch processing with 1000 messages threshold (was 20)
+    MESSAGE_BATCH_SIZE = 1000
     all_data = []
     skipped_urls = 0
 
@@ -123,19 +171,35 @@ def process_large_issue_and_pr_message_collection(repo_id, repo_git: str, logger
         except UrlNotFoundException:
             logger.info(f"{task_name}: PR or issue comment url of {comment_url} returned 404. Skipping.")
             skipped_urls += 1
-       
-        if len(all_data) >= 20:
-            process_messages(all_data, task_name, repo_id, logger, augur_db)
+
+        if len(all_data) >= MESSAGE_BATCH_SIZE:
+            process_messages(all_data, task_name, repo_id, logger, augur_db, issue_url_to_id_map, pr_issue_url_to_id_map)
             all_data.clear()
 
     if len(all_data) > 0:
-        process_messages(all_data, task_name, repo_id, logger, augur_db)
+        process_messages(all_data, task_name, repo_id, logger, augur_db, issue_url_to_id_map, pr_issue_url_to_id_map)
 
     logger.info(f"{task_name}: Finished. Skipped {skipped_urls} comment URLs due to 404.")
         
 
-def process_messages(messages, task_name, repo_id, logger, augur_db):
+def process_messages(messages, task_name, repo_id, logger, augur_db, issue_url_to_id_map, pr_issue_url_to_id_map):
+    """
+    Process a batch of messages and insert into the database.
 
+    Args:
+        messages: List of message dicts from GitHub API.
+        task_name: Task name for logging.
+        repo_id: The repository ID.
+        logger: Logger instance.
+        augur_db: Database session instance.
+        issue_url_to_id_map: Pre-built mapping of issue URLs to issue IDs.
+        pr_issue_url_to_id_map: Pre-built mapping of PR issue URLs to PR IDs.
+
+    Note:
+        The URL-to-ID mappings should be built ONCE by the caller using
+        _build_message_mappings(), not per batch. This avoids full table
+        scans on every batch iteration.
+    """
     tool_source = "Pr comment task"
     tool_version = "2.0"
     data_source = "Github API"
@@ -150,19 +214,6 @@ def process_messages(messages, task_name, repo_id, logger, augur_db):
 
     if len(messages) == 0:
         logger.info(f"{task_name}: No messages to process")
-
-    # create mapping from issue url to issue id of current issues
-    issue_url_to_id_map = {}
-    issues = augur_db.session.query(Issue).filter(Issue.repo_id == repo_id).all()
-    for issue in issues:
-        issue_url_to_id_map[issue.issue_url] = issue.issue_id
-
-    # create mapping from pr url to pr id of current pull requests
-    pr_issue_url_to_id_map = {}
-    prs = augur_db.session.query(PullRequest).filter(PullRequest.repo_id == repo_id).all()
-    for pr in prs:
-        pr_issue_url_to_id_map[pr.pr_issue_url] = pr.pull_request_id
-
 
     message_len = len(messages)
     for index, message in enumerate(messages):
