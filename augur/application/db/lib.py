@@ -175,6 +175,38 @@ def get_active_repo_count(collection_type):
         return session.query(CollectionStatus).filter(getattr(CollectionStatus,f"{collection_type}_status" ) == CollectionState.COLLECTING.value).count()
 
 
+def _fix_invalid_timezone(timestamp_str: str, postgres_valid_timezones: set) -> Optional[str]:
+    """
+    Check if a timestamp has an invalid PostgreSQL timezone and return the corrected version.
+
+    Args:
+        timestamp_str: Timestamp in format "YYYY-MM-DD HH:MM:SS ±HHMM"
+        postgres_valid_timezones: Set of valid timezone offsets as integers
+
+    Returns:
+        Corrected timestamp with +0000 timezone if original was invalid,
+        None if the original timezone was valid.
+    """
+    segments = re.split(" ", timestamp_str)
+    tzdata = segments.pop()
+
+    if ":" in tzdata:
+        tzdata = tzdata.replace(":", "")
+
+    try:
+        tz_int = int(tzdata)
+    except ValueError:
+        # Can't parse timezone as int (e.g., "UTC", "EST"), treat as invalid
+        segments.append("+0000")
+        return " ".join(segments)
+
+    if tz_int not in postgres_valid_timezones:
+        segments.append("+0000")
+        return " ".join(segments)
+
+    return None
+
+
 def facade_bulk_insert_commits(logger, records):
 
     with get_session() as session:
@@ -187,7 +219,7 @@ def facade_bulk_insert_commits(logger, records):
             session.commit()
         except Exception as e:
             session.rollback()
-            
+
             if len(records) > 1:
                 #split list into halves and retry insert until we isolate offending record
                 firsthalfRecords = records[:len(records)//2]
@@ -197,12 +229,9 @@ def facade_bulk_insert_commits(logger, records):
                 facade_bulk_insert_commits(logger, secondhalfRecords)
             elif len(records) == 1:
                 commit_record = records[0]
-                #replace incomprehensible dates with epoch.
-                #2021-10-11 11:57:46 -0500
-                
-                # placeholder_date = "1970-01-01 00:00:15 -0500"
-                placeholder_date = commit_record['cmt_author_timestamp']
 
+                # Valid PostgreSQL timezone offsets (integer representation)
+                # e.g., -500 represents -05:00, +330 represents +03:30
                 postgres_valid_timezones = {
                     -1200, -1100, -1000, -930, -900, -800, -700,
                     -600, -500, -400, -300, -230, -200, -100, 000,
@@ -210,30 +239,27 @@ def facade_bulk_insert_commits(logger, records):
                     630, 700, 800, 845, 900, 930, 1000, 1030, 1100, 1200,
                     1245, 1300, 1400
                 }
-                
-                # Reconstruct timezone portion of the date string to UTC
-                placeholder_date_segments = re.split(" ", placeholder_date)
-                tzdata = placeholder_date_segments.pop()
 
-                if ":" in tzdata:
-                    tzdata = tzdata.replace(":", "")
+                # Check both timestamps for invalid timezones
+                author_fixed = _fix_invalid_timezone(
+                    commit_record['cmt_author_timestamp'],
+                    postgres_valid_timezones
+                )
+                committer_fixed = _fix_invalid_timezone(
+                    commit_record['cmt_committer_timestamp'],
+                    postgres_valid_timezones
+                )
 
-                if int(tzdata) not in postgres_valid_timezones:
-                    tzdata = "+0000"
-                else:
+                # If both timezones are valid, the error is something else - re-raise
+                if author_fixed is None and committer_fixed is None:
                     raise e
 
-                placeholder_date_segments.append(tzdata)
+                # Apply fixes independently, preserving valid timestamps
+                if author_fixed is not None:
+                    commit_record['cmt_author_timestamp'] = author_fixed
+                if committer_fixed is not None:
+                    commit_record['cmt_committer_timestamp'] = committer_fixed
 
-                placeholder_date = " ".join(placeholder_date_segments)
-
-                #Check for improper utc timezone offset
-                #UTC timezone offset should be between -14:00 and +14:00
-
-                # analyzecommit.generate_commit_record() defines the keys on the commit_record dictionary
-                commit_record['cmt_author_timestamp'] = placeholder_date
-                commit_record['cmt_committer_timestamp'] = placeholder_date
-                
                 logger.warning(f"commit with invalid timezone set to UTC: {commit_record['cmt_commit_hash']}")
 
                 session.execute(
